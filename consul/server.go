@@ -132,6 +132,10 @@ type Server struct {
 	raftTransport *raft.NetworkTransport
 	raftInmem     *raft.InmemStore
 
+	// leaderCh set up by setupRaft() and ensures that we get reliable leader
+	// transition notifications from the Raft layer.
+	leaderCh <-chan bool
+
 	// reconcileCh is used to pass events from the serf handler
 	// into the leader manager, so that the strong state can be
 	// updated
@@ -285,7 +289,7 @@ func NewServer(config *Config) (*Server, error) {
 	if s.IsACLReplicationEnabled() {
 		local = s.aclLocalFault
 	}
-	if s.aclCache, err = newAclCache(config, logger, s.RPC, local); err != nil {
+	if s.aclCache, err = newACLCache(config, logger, s.RPC, local); err != nil {
 		s.Shutdown()
 		return nil, fmt.Errorf("Failed to create non-authoritative ACL cache: %v", err)
 	}
@@ -330,9 +334,8 @@ func NewServer(config *Config) (*Server, error) {
 	portFn := func(s *agent.Server) (int, bool) {
 		if s.WanJoinPort > 0 {
 			return s.WanJoinPort, true
-		} else {
-			return 0, false
 		}
+		return 0, false
 	}
 	go s.Flood(portFn, s.serfWAN)
 
@@ -553,6 +556,11 @@ func (s *Server) setupRaft() error {
 			}
 		}
 	}
+
+	// Set up a channel for reliable leader notifications.
+	leaderCh := make(chan bool, 1)
+	s.config.RaftConfig.NotifyCh = leaderCh
+	s.leaderCh = leaderCh
 
 	// Setup the Raft store.
 	s.raft, err = raft.NewRaft(s.config.RaftConfig, s.fsm, log, stable, snap, trans)
@@ -794,8 +802,8 @@ func (s *Server) JoinWAN(addrs []string) (int, error) {
 }
 
 // LocalMember is used to return the local node
-func (c *Server) LocalMember() serf.Member {
-	return c.serfLAN.LocalMember()
+func (s *Server) LocalMember() serf.Member {
+	return s.serfLAN.LocalMember()
 }
 
 // LANMembers is used to return the members of the LAN cluster

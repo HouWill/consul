@@ -14,6 +14,7 @@ import (
 
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/consul/watch"
 	"github.com/mitchellh/mapstructure"
@@ -358,6 +359,11 @@ type Config struct {
 	// to a randomly-generated ID that persists in the data-dir.
 	NodeID types.NodeID `mapstructure:"node_id"`
 
+	// DisableHostNodeID will prevent Consul from using information from the
+	// host to generate a node ID, and will cause Consul to generate a
+	// random ID instead.
+	DisableHostNodeID bool `mapstructure:"disable_host_node_id"`
+
 	// Node name is the name we use to advertise. Defaults to hostname.
 	NodeName string `mapstructure:"node_name"`
 
@@ -464,6 +470,10 @@ type Config struct {
 	// or VerifyOutgoing to verify the TLS connection.
 	CAFile string `mapstructure:"ca_file"`
 
+	// CAPath is a path to a directory of certificate authority files. This is used with
+	// VerifyIncoming or VerifyOutgoing to verify the TLS connection.
+	CAPath string `mapstructure:"ca_path"`
+
 	// CertFile is used to provide a TLS certificate that is used for serving TLS connections.
 	// Must be provided to serve TLS connections.
 	CertFile string `mapstructure:"cert_file"`
@@ -478,6 +488,14 @@ type Config struct {
 
 	// TLSMinVersion is used to set the minimum TLS version used for TLS connections.
 	TLSMinVersion string `mapstructure:"tls_min_version"`
+
+	// TLSCipherSuites is used to specify the list of supported ciphersuites.
+	TLSCipherSuites    []uint16 `mapstructure:"-" json:"-"`
+	TLSCipherSuitesRaw string   `mapstructure:"tls_cipher_suites"`
+
+	// TLSPreferServerCipherSuites specifies whether to prefer the server's ciphersuite
+	// over the client ciphersuites.
+	TLSPreferServerCipherSuites bool `mapstructure:"tls_prefer_server_cipher_suites"`
 
 	// StartJoin is a list of addresses to attempt to join when the
 	// agent starts. If Serf is unable to communicate with any of these
@@ -531,13 +549,13 @@ type Config struct {
 	ReconnectTimeoutWan    time.Duration `mapstructure:"-"`
 	ReconnectTimeoutWanRaw string        `mapstructure:"reconnect_timeout_wan"`
 
-	// EnableUi enables the statically-compiled assets for the Consul web UI and
+	// EnableUI enables the statically-compiled assets for the Consul web UI and
 	// serves them at the default /ui/ endpoint automatically.
-	EnableUi bool `mapstructure:"ui"`
+	EnableUI bool `mapstructure:"ui"`
 
-	// UiDir is the directory containing the Web UI resources.
+	// UIDir is the directory containing the Web UI resources.
 	// If provided, the UI endpoints will be enabled.
-	UiDir string `mapstructure:"ui_dir"`
+	UIDir string `mapstructure:"ui_dir"`
 
 	// PidFile is the file to store our PID in
 	PidFile string `mapstructure:"pid_file"`
@@ -713,7 +731,7 @@ type Config struct {
 	VersionPrerelease string `mapstructure:"-"`
 
 	// WatchPlans contains the compiled watches
-	WatchPlans []*watch.WatchPlan `mapstructure:"-" json:"-"`
+	WatchPlans []*watch.Plan `mapstructure:"-" json:"-"`
 
 	// UnixSockets is a map of socket configuration data
 	UnixSockets UnixSocketConfig `mapstructure:"unix_sockets"`
@@ -844,7 +862,7 @@ func DevConfig() *Config {
 	conf.Server = true
 	conf.EnableDebug = true
 	conf.DisableAnonymousSignature = true
-	conf.EnableUi = true
+	conf.EnableUI = true
 	conf.BindAddr = "127.0.0.1"
 	return conf
 }
@@ -1173,6 +1191,14 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 		return nil, fmt.Errorf("Performance.RaftMultiplier must be <= %d", consul.MaxRaftMultiplier)
 	}
 
+	if raw := result.TLSCipherSuitesRaw; raw != "" {
+		ciphers, err := tlsutil.ParseCiphers(raw)
+		if err != nil {
+			return nil, fmt.Errorf("TLSCipherSuites invalid: %v", err)
+		}
+		result.TLSCipherSuites = ciphers
+	}
+
 	return &result, nil
 }
 
@@ -1260,44 +1286,44 @@ func FixupCheckType(raw interface{}) error {
 	if ttl, ok := rawMap[ttlKey]; ok {
 		ttlS, ok := ttl.(string)
 		if ok {
-			if dur, err := time.ParseDuration(ttlS); err != nil {
+			dur, err := time.ParseDuration(ttlS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[ttlKey] = dur
 			}
+			rawMap[ttlKey] = dur
 		}
 	}
 
 	if interval, ok := rawMap[intervalKey]; ok {
 		intervalS, ok := interval.(string)
 		if ok {
-			if dur, err := time.ParseDuration(intervalS); err != nil {
+			dur, err := time.ParseDuration(intervalS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[intervalKey] = dur
 			}
+			rawMap[intervalKey] = dur
 		}
 	}
 
 	if timeout, ok := rawMap[timeoutKey]; ok {
 		timeoutS, ok := timeout.(string)
 		if ok {
-			if dur, err := time.ParseDuration(timeoutS); err != nil {
+			dur, err := time.ParseDuration(timeoutS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[timeoutKey] = dur
 			}
+			rawMap[timeoutKey] = dur
 		}
 	}
 
 	if deregister, ok := rawMap[deregisterKey]; ok {
 		timeoutS, ok := deregister.(string)
 		if ok {
-			if dur, err := time.ParseDuration(timeoutS); err != nil {
+			dur, err := time.ParseDuration(timeoutS)
+			if err != nil {
 				return err
-			} else {
-				rawMap[deregisterKey] = dur
 			}
+			rawMap[deregisterKey] = dur
 		}
 	}
 
@@ -1370,6 +1396,9 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.NodeID != "" {
 		result.NodeID = b.NodeID
+	}
+	if b.DisableHostNodeID == true {
+		result.DisableHostNodeID = b.DisableHostNodeID
 	}
 	if b.NodeName != "" {
 		result.NodeName = b.NodeName
@@ -1509,6 +1538,9 @@ func MergeConfig(a, b *Config) *Config {
 	if b.CAFile != "" {
 		result.CAFile = b.CAFile
 	}
+	if b.CAPath != "" {
+		result.CAPath = b.CAPath
+	}
 	if b.CertFile != "" {
 		result.CertFile = b.CertFile
 	}
@@ -1520,6 +1552,12 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.TLSMinVersion != "" {
 		result.TLSMinVersion = b.TLSMinVersion
+	}
+	if len(b.TLSCipherSuites) != 0 {
+		result.TLSCipherSuites = append(result.TLSCipherSuites, b.TLSCipherSuites...)
+	}
+	if b.TLSPreferServerCipherSuites {
+		result.TLSPreferServerCipherSuites = true
 	}
 	if b.Checks != nil {
 		result.Checks = append(result.Checks, b.Checks...)
@@ -1560,11 +1598,11 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Addresses.RPC != "" {
 		result.Addresses.RPC = b.Addresses.RPC
 	}
-	if b.EnableUi {
-		result.EnableUi = true
+	if b.EnableUI {
+		result.EnableUI = true
 	}
-	if b.UiDir != "" {
-		result.UiDir = b.UiDir
+	if b.UIDir != "" {
+		result.UIDir = b.UIDir
 	}
 	if b.PidFile != "" {
 		result.PidFile = b.PidFile

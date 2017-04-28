@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"crypto/sha512"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
@@ -451,11 +453,14 @@ func (a *Agent) consulConfig() *consul.Config {
 	base.VerifyOutgoing = a.config.VerifyOutgoing
 	base.VerifyServerHostname = a.config.VerifyServerHostname
 	base.CAFile = a.config.CAFile
+	base.CAPath = a.config.CAPath
 	base.CertFile = a.config.CertFile
 	base.KeyFile = a.config.KeyFile
 	base.ServerName = a.config.ServerName
 	base.Domain = a.config.Domain
 	base.TLSMinVersion = a.config.TLSMinVersion
+	base.TLSCipherSuites = a.config.TLSCipherSuites
+	base.TLSPreferServerCipherSuites = a.config.TLSPreferServerCipherSuites
 
 	// Setup the ServerUp callback
 	base.ServerUp = a.state.ConsulServerUp
@@ -629,6 +634,11 @@ func (a *Agent) makeRandomID() (string, error) {
 // high for us if this changes, so we will persist it either way. This will let
 // gopsutil change implementations without affecting in-place upgrades of nodes.
 func (a *Agent) makeNodeID() (string, error) {
+	// If they've disabled host-based IDs then just make a random one.
+	if a.config.DisableHostNodeID {
+		return a.makeRandomID()
+	}
+
 	// Try to get a stable ID associated with the host itself.
 	info, err := host.Info()
 	if err != nil {
@@ -644,6 +654,17 @@ func (a *Agent) makeNodeID() (string, error) {
 			id, err)
 		return a.makeRandomID()
 	}
+
+	// Hash the input to make it well distributed. The reported Host UUID may be
+	// similar across nodes if they are on a cloud provider or on motherboards
+	// created from the same batch.
+	buf := sha512.Sum512([]byte(id))
+	id = fmt.Sprintf("%08x-%04x-%04x-%04x-%12x",
+		buf[0:4],
+		buf[4:6],
+		buf[6:8],
+		buf[8:10],
+		buf[10:16])
 
 	a.logger.Printf("[DEBUG] Using unique ID %q from host as node ID", id)
 	return id, nil
@@ -777,9 +798,8 @@ func (a *Agent) SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.
 func (a *Agent) Leave() error {
 	if a.server != nil {
 		return a.server.Leave()
-	} else {
-		return a.client.Leave()
 	}
+	return a.client.Leave()
 }
 
 // Shutdown is used to hard stop the agent. Should be
@@ -877,27 +897,24 @@ func (a *Agent) ForceLeave(node string) (err error) {
 func (a *Agent) LocalMember() serf.Member {
 	if a.server != nil {
 		return a.server.LocalMember()
-	} else {
-		return a.client.LocalMember()
 	}
+	return a.client.LocalMember()
 }
 
 // LANMembers is used to retrieve the LAN members
 func (a *Agent) LANMembers() []serf.Member {
 	if a.server != nil {
 		return a.server.LANMembers()
-	} else {
-		return a.client.LANMembers()
 	}
+	return a.client.LANMembers()
 }
 
 // WANMembers is used to retrieve the WAN members
 func (a *Agent) WANMembers() []serf.Member {
 	if a.server != nil {
 		return a.server.WANMembers()
-	} else {
-		return nil
 	}
+	return nil
 }
 
 // StartSync is called once Services and Checks are registered.
@@ -922,9 +939,8 @@ func (a *Agent) ResumeSync() {
 func (a *Agent) GetCoordinate() (*coordinate.Coordinate, error) {
 	if a.config.Server {
 		return a.server.GetLANCoordinate()
-	} else {
-		return a.client.GetCoordinate()
 	}
+	return a.client.GetCoordinate()
 }
 
 // sendCoordinate is a long-running loop that periodically sends our coordinate
@@ -1161,7 +1177,7 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes CheckTypes, pe
 			Node:        a.config.NodeName,
 			CheckID:     types.CheckID(checkID),
 			Name:        fmt.Sprintf("Service '%s' check", service.Service),
-			Status:      structs.HealthCritical,
+			Status:      api.HealthCritical,
 			Notes:       chkType.Notes,
 			ServiceID:   service.ID,
 			ServiceName: service.Service,
@@ -1756,7 +1772,7 @@ func (a *Agent) loadChecks(conf *Config) error {
 		} else {
 			// Default check to critical to avoid placing potentially unhealthy
 			// services into the active pool
-			p.Check.Status = structs.HealthCritical
+			p.Check.Status = api.HealthCritical
 
 			if err := a.AddCheck(p.Check, p.ChkType, false, p.Token); err != nil {
 				// Purge the check if it is unable to be restored.
@@ -1821,9 +1837,8 @@ func parseMetaPair(raw string) (string, string) {
 	pair := strings.SplitN(raw, ":", 2)
 	if len(pair) == 2 {
 		return pair[0], pair[1]
-	} else {
-		return pair[0], ""
 	}
+	return pair[0], ""
 }
 
 // unloadMetadata resets the local metadata state
@@ -1866,7 +1881,7 @@ func (a *Agent) EnableServiceMaintenance(serviceID, reason, token string) error 
 		Notes:       reason,
 		ServiceID:   service.ID,
 		ServiceName: service.Service,
-		Status:      structs.HealthCritical,
+		Status:      api.HealthCritical,
 	}
 	a.AddCheck(check, nil, true, token)
 	a.logger.Printf("[INFO] agent: Service %q entered maintenance mode", serviceID)
@@ -1912,7 +1927,7 @@ func (a *Agent) EnableNodeMaintenance(reason, token string) {
 		CheckID: structs.NodeMaint,
 		Name:    "Node Maintenance Mode",
 		Notes:   reason,
-		Status:  structs.HealthCritical,
+		Status:  api.HealthCritical,
 	}
 	a.AddCheck(check, nil, true, token)
 	a.logger.Printf("[INFO] agent: Node entered maintenance mode")
