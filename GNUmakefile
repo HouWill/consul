@@ -4,7 +4,10 @@ GOTOOLS = \
 	github.com/jteeuwen/go-bindata/... \
 	github.com/mitchellh/gox \
 	golang.org/x/tools/cmd/cover \
-	golang.org/x/tools/cmd/stringer
+	golang.org/x/tools/cmd/stringer \
+	github.com/axw/gocov/gocov \
+	gopkg.in/matm/v1/gocov-html
+
 GOTAGS ?= consul
 GOFILES ?= $(shell go list ./... | grep -v /vendor/)
 GOOS=$(shell go env GOOS)
@@ -28,10 +31,15 @@ bin: tools
 
 # dev creates binaries for testing locally - these are put into ./bin and $GOPATH
 dev:
-	mkdir -p pkg/$(GOOS)_$(GOARCH)
+	mkdir -p pkg/$(GOOS)_$(GOARCH)/ bin/
 	go install -ldflags '$(GOLDFLAGS)' -tags '$(GOTAGS)'
-	cp $(GOPATH)/bin/consul bin
+	cp $(GOPATH)/bin/consul bin/
 	cp $(GOPATH)/bin/consul pkg/$(GOOS)_$(GOARCH)
+
+# linux builds a linux package independent of the source platform
+linux:
+	mkdir -p pkg/linux_amd64/
+	GOOS=linux GOARCH=amd64 go build -ldflags '$(GOLDFLAGS)' -tags '$(GOTAGS)' -o pkg/linux_amd64/consul
 
 # dist builds binaries for all platforms and packages them for distribution
 dist:
@@ -41,9 +49,21 @@ cov:
 	gocov test $(GOFILES) | gocov-html > /tmp/coverage.html
 	open /tmp/coverage.html
 
-test: dev
-	go test -tags "$(GOTAGS)" -i -run '^$$' ./...
-	( set -o pipefail ; go test -tags "$(GOTAGS)" -v $(GOFILES) | tee test.log )
+test: dev vet
+	go test -tags '$(GOTAGS)' -i ./...
+	go test $(GOTEST_FLAGS) -tags '$(GOTAGS)' -timeout 7m -v ./... 2>&1 >test$(GOTEST_FLAGS).log ; echo $$? > exit-code
+	@echo "Exit code: `cat exit-code`" >> test$(GOTEST_FLAGS).log
+	@echo "----"
+	@grep -A5 'DATA RACE' test.log || true
+	@grep -A10 'panic: test timed out' test.log || true
+	@grep '^PASS' test.log | uniq || true
+	@grep -A1 -- '--- FAIL:' test.log || true
+	@grep '^FAIL' test.log || true
+	@test "$$TRAVIS" == "true" && cat test.log || true
+	@exit $$(cat exit-code)
+
+test-race:
+	$(MAKE) GOTEST_FLAGS=-race
 
 cover:
 	go test $(GOFILES) --cover
@@ -61,16 +81,18 @@ vet:
 		exit 1; \
 	fi
 
-# build the static web ui and build static assets inside a Docker container, the
-# same way a release build works
+# Build the static web ui and build static assets inside a Docker container, the
+# same way a release build works. This implicitly does a "make static-assets" at
+# the end.
 ui:
 	@sh -c "'$(CURDIR)/scripts/ui.sh'"
 
-# generates the static web ui that's compiled into the binary
+# If you've run "make ui" manually then this will get called for you. This is
+# also run as part of the release build script when it verifies that there are no
+# changes to the UI assets that aren't checked in.
 static-assets:
-	@echo "--> Generating static assets"
 	@go-bindata-assetfs -pkg agent -prefix pkg ./pkg/web_ui/...
-	@mv bindata_assetfs.go command/agent
+	@mv bindata_assetfs.go agent/
 	$(MAKE) format
 
 tools:
